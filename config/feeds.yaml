@@ -1,0 +1,35 @@
+feeds:
+  - id: "feodo_tracker"
+    name: "abuse.ch Feodo Tracker (Botnet C2)"
+    source_type: "file"
+    path: "data/samples/feodo_botnet_sample.json"
+    remote_url: "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.json"
+    format: "json"
+    weight: 5.0
+    description: "High-confidence botnet command and control (C2) servers (Emotet, QakBot, Dridex)."
+
+  - id: "urlhaus"
+    name: "abuse.ch URLhaus (Malware URLs)"
+    source_type: "file"
+    path: "data/samples/urlhaus_malware_sample.csv"
+    remote_url: "https://urlhaus.abuse.ch/downloads/csv_recent/"
+    format: "csv"
+    weight: 4.0
+    description: "Malicious URLs actively distributing malware payloads."
+
+  - id: "blocklist_de"
+    name: "Blocklist.de (Attacking IPs)"
+    source_type: "file"
+    path: "data/samples/blocklist_de_sample.txt"
+    remote_url: "https://lists.blocklist.de/lists/all.txt"
+    format: "txt"
+    weight: 3.0
+    description: "IP addresses reported for brute-force attacks and service scanning."
+
+  - id: "internal_soc"
+    name: "Internal SOC Escalations"
+    source_type: "file"
+    path: "data/samples/internal_soc_sample.json"
+    format: "json"
+    weight: 5.0
+    description: "Internal security incidents, honeypot captures, and verified forensic IOCs."

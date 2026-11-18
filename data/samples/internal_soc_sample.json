@@ -1,0 +1,37 @@
+[
+  {
+    "incident_id": "INC-2026-881",
+    "threat_type": "c2_ip",
+    "indicator": "185.220.101.5",
+    "notes": "Verified C2 connection from workstation WKSTN-044",
+    "detected_at": "2026-10-29 16:20:00"
+  },
+  {
+    "incident_id": "INC-2026-881",
+    "threat_type": "payload_hash_sha256",
+    "indicator": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "notes": "Dropped dropper binary found in AppData",
+    "detected_at": "2026-10-29 16:22:00"
+  },
+  {
+    "incident_id": "INC-2026-881",
+    "threat_type": "payload_hash_md5",
+    "indicator": "d41d8cd98f00b204e9800998ecf8427e",
+    "notes": "MD5 checksum of secondary stage",
+    "detected_at": "2026-10-29 16:23:00"
+  },
+  {
+    "incident_id": "INC-2026-882",
+    "threat_type": "phishing_email",
+    "indicator": "attacker[@]spearphish[.]net",
+    "notes": "Sender of malicious macro-enabled invoice",
+    "detected_at": "2026-10-30 08:00:00"
+  },
+  {
+    "incident_id": "INC-2026-883",
+    "threat_type": "malicious_domain",
+    "indicator": "evil-payload[.]top",
+    "notes": "Phishing credential harvest portal",
+    "detected_at": "2026-10-30 09:15:00"
+  }
+]

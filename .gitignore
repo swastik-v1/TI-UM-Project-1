@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Data & local databases
+*.db
+*.sqlite3
+data/ti_aggregator.db
+!data/samples/
+
+# Output exports & reports (keep directory structure)
+exports/*
+!exports/.gitkeep
+
+# Repomix (keep local)
+repomix*
+repomix-output.*
+
+# Environment variables & secrets
+.env
+.env.local
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp

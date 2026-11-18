@@ -1,0 +1,25 @@
+database:
+  path: "data/ti_aggregator.db"
+
+scoring:
+  threshold_medium: 3.0
+  threshold_high: 6.0
+  overlap_bonus_two_sources: 1.5
+  overlap_bonus_three_plus: 3.0
+
+exports:
+  firewall_ips: "exports/blocklist_firewall.txt"
+  dns_domains: "exports/blocklist_dns.txt"
+  proxy_urls: "exports/blocklist_proxy.txt"
+  edr_hashes: "exports/blocklist_edr.csv"
+  all_json: "exports/threat_intel_full.json"
+  summary_report: "exports/threat_report.md"
+  min_severity_for_firewall: "HIGH"
+  min_severity_for_dns: "HIGH"
+  min_severity_for_proxy: "MEDIUM"
+  min_severity_for_edr: "MEDIUM"
+
+enrichment:
+  cache_ttl_ip_days: 3
+  cache_ttl_domain_days: 7
+  cache_ttl_hash_days: 30

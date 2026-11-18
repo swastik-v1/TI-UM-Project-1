@@ -1,0 +1,353 @@
+"""Database repository handling CRUD operations, upserts, and analytics."""
+
+from datetime import datetime, timezone, timedelta
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import sqlite3
+
+from src.models import IOCType, ParsedIndicator, ScoredIndicator, Severity
+from src.storage.database import get_db_connection
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class IOCRepository:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+
+    def record_feed_status(
+        self,
+        feed_id: str,
+        name: str,
+        source_type: str,
+        path_or_url: str,
+        format_str: str,
+        weight: float,
+        status: str,
+        ioc_count: int,
+    ) -> None:
+        """Records feed metadata and execution status."""
+        now = utc_now_iso()
+        with get_db_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO feeds (feed_id, name, source_type, path_or_url, format, weight, last_fetched, status, ioc_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(feed_id) DO UPDATE SET
+                    name = excluded.name,
+                    source_type = excluded.source_type,
+                    path_or_url = excluded.path_or_url,
+                    format = excluded.format,
+                    last_fetched = excluded.last_fetched,
+                    status = excluded.status,
+                    ioc_count = excluded.ioc_count,
+                    weight = excluded.weight
+                """,
+                (feed_id, name, source_type, path_or_url, format_str, weight, now, status, ioc_count),
+            )
+            conn.commit()
+
+    def ensure_feed_exists(self, feed_id: str, feed_name: Optional[str] = None) -> None:
+        """Ensures a feed row exists so foreign key references are valid."""
+        with get_db_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO feeds (feed_id, name, source_type, path_or_url, format, weight)
+                VALUES (?, ?, 'feed', '', 'txt', 1.0)
+                ON CONFLICT(feed_id) DO NOTHING
+                """,
+                (feed_id, feed_name or feed_id),
+            )
+            conn.commit()
+
+    def save_parsed_indicator(self, indicator: ParsedIndicator) -> int:
+        """Upserts a parsed indicator and links it to its reporting feed.
+
+        Returns:
+            ioc_id (int)
+        """
+        now_str = indicator.timestamp.isoformat()
+        # Ensure parent feed exists before inserting relation
+        self.ensure_feed_exists(indicator.feed_id)
+
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Insert or update indicator
+            cursor.execute(
+                """
+                INSERT INTO iocs (value, ioc_type, first_seen, last_seen, occurrence_count)
+                VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(value) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    occurrence_count = iocs.occurrence_count + 1
+                RETURNING ioc_id
+                """,
+                (indicator.value, indicator.ioc_type.value, now_str, now_str),
+            )
+            row = cursor.fetchone()
+            ioc_id = row[0]
+
+            # Upsert relation with feed
+            cursor.execute(
+                """
+                INSERT INTO ioc_feed_relations (ioc_id, feed_id, raw_context, observed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(ioc_id, feed_id) DO UPDATE SET
+                    raw_context = CASE
+                        WHEN excluded.raw_context != '' THEN excluded.raw_context
+                        ELSE ioc_feed_relations.raw_context
+                    END,
+                    observed_at = excluded.observed_at
+                """,
+                (ioc_id, indicator.feed_id, indicator.context, now_str),
+            )
+            conn.commit()
+            return ioc_id
+
+    def get_raw_correlations(self) -> List[Dict[str, Any]]:
+        """Retrieves raw relation data for all IOCs to calculate scores."""
+        query = """
+            SELECT
+                i.ioc_id,
+                i.value,
+                i.ioc_type,
+                i.first_seen,
+                i.last_seen,
+                i.occurrence_count,
+                i.is_whitelisted,
+                GROUP_CONCAT(DISTINCT r.feed_id) AS feed_ids,
+                GROUP_CONCAT(DISTINCT r.raw_context) AS contexts,
+                COUNT(DISTINCT r.feed_id) AS distinct_feed_count
+            FROM iocs i
+            JOIN ioc_feed_relations r ON i.ioc_id = r.ioc_id
+            GROUP BY i.ioc_id
+        """
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute(query).fetchall()
+            results = []
+            for r in rows:
+                feed_ids = [fid.strip() for fid in (r["feed_ids"] or "").split(",") if fid.strip()]
+                contexts = [c.strip() for c in (r["contexts"] or "").split(",") if c.strip()]
+                results.append({
+                    "ioc_id": r["ioc_id"],
+                    "value": r["value"],
+                    "ioc_type": IOCType(r["ioc_type"]),
+                    "first_seen": r["first_seen"],
+                    "last_seen": r["last_seen"],
+                    "occurrence_count": r["occurrence_count"],
+                    "is_whitelisted": bool(r["is_whitelisted"]),
+                    "feed_ids": feed_ids,
+                    "contexts": contexts,
+                    "distinct_feed_count": r["distinct_feed_count"],
+                })
+            return results
+
+    def batch_update_scores(self, updates: List[Tuple[float, str, int]]) -> None:
+        """Updates score and severity in batch: [(score, severity_str, ioc_id), ...]"""
+        if not updates:
+            return
+        with get_db_connection(self.db_path) as conn:
+            conn.executemany(
+                "UPDATE iocs SET calculated_score = ?, severity = ? WHERE ioc_id = ?",
+                updates,
+            )
+            conn.commit()
+
+    def get_all_scored_indicators(
+        self,
+        min_severity: Optional[str] = None,
+        ioc_type: Optional[IOCType] = None,
+    ) -> List[ScoredIndicator]:
+        """Fetches scored indicators with optional filters."""
+        query = """
+            SELECT
+                i.ioc_id,
+                i.value,
+                i.ioc_type,
+                i.first_seen,
+                i.last_seen,
+                i.occurrence_count,
+                i.calculated_score,
+                i.severity,
+                i.is_whitelisted,
+                GROUP_CONCAT(DISTINCT r.feed_id) AS feed_ids,
+                GROUP_CONCAT(DISTINCT r.raw_context) AS contexts
+            FROM iocs i
+            LEFT JOIN ioc_feed_relations r ON i.ioc_id = r.ioc_id
+            WHERE 1=1
+        """
+        params = []
+        if min_severity:
+            sev_levels = {"LOW": ["LOW", "MEDIUM", "HIGH"], "MEDIUM": ["MEDIUM", "HIGH"], "HIGH": ["HIGH"]}
+            allowed = sev_levels.get(min_severity.upper(), ["HIGH"])
+            placeholders = ",".join("?" for _ in allowed)
+            query += f" AND i.severity IN ({placeholders})"
+            params.extend(allowed)
+
+        if ioc_type:
+            query += " AND i.ioc_type = ?"
+            params.append(ioc_type.value)
+
+        query += " GROUP BY i.ioc_id ORDER BY i.calculated_score DESC, i.occurrence_count DESC"
+
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute(query, params).fetchall()
+            indicators = []
+            for r in rows:
+                sources = [s.strip() for s in (r["feed_ids"] or "").split(",") if s.strip()]
+                contexts = [c.strip() for c in (r["contexts"] or "").split(",") if c.strip()]
+                indicators.append(
+                    ScoredIndicator(
+                        ioc_id=r["ioc_id"],
+                        value=r["value"],
+                        ioc_type=IOCType(r["ioc_type"]),
+                        first_seen=r["first_seen"],
+                        last_seen=r["last_seen"],
+                        occurrence_count=r["occurrence_count"],
+                        calculated_score=float(r["calculated_score"]),
+                        severity=Severity(r["severity"]),
+                        is_whitelisted=bool(r["is_whitelisted"]),
+                        sources=sources,
+                        contexts=contexts,
+                    )
+                )
+            return indicators
+
+    def get_indicator_by_value(self, value: str) -> Optional[ScoredIndicator]:
+        """Searches for a specific indicator by exact string value."""
+        query = """
+            SELECT
+                i.ioc_id,
+                i.value,
+                i.ioc_type,
+                i.first_seen,
+                i.last_seen,
+                i.occurrence_count,
+                i.calculated_score,
+                i.severity,
+                i.is_whitelisted,
+                GROUP_CONCAT(DISTINCT r.feed_id) AS feed_ids,
+                GROUP_CONCAT(DISTINCT r.raw_context) AS contexts
+            FROM iocs i
+            LEFT JOIN ioc_feed_relations r ON i.ioc_id = r.ioc_id
+            WHERE i.value = ?
+            GROUP BY i.ioc_id
+        """
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            r = cursor.execute(query, (value.strip(),)).fetchone()
+            if not r:
+                return None
+            sources = [s.strip() for s in (r["feed_ids"] or "").split(",") if s.strip()]
+            contexts = [c.strip() for c in (r["contexts"] or "").split(",") if c.strip()]
+            return ScoredIndicator(
+                ioc_id=r["ioc_id"],
+                value=r["value"],
+                ioc_type=IOCType(r["ioc_type"]),
+                first_seen=r["first_seen"],
+                last_seen=r["last_seen"],
+                occurrence_count=r["occurrence_count"],
+                calculated_score=float(r["calculated_score"]),
+                severity=Severity(r["severity"]),
+                is_whitelisted=bool(r["is_whitelisted"]),
+                sources=sources,
+                contexts=contexts,
+            )
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Computes summary metrics for reporting and dashboard."""
+        with get_db_connection(self.db_path) as conn:
+            c = conn.cursor()
+
+            total_unique = c.execute("SELECT COUNT(*) FROM iocs").fetchone()[0]
+
+            # Breakdown by type
+            type_rows = c.execute("SELECT ioc_type, COUNT(*) FROM iocs GROUP BY ioc_type").fetchall()
+            by_type = {row[0]: row[1] for row in type_rows}
+
+            # Breakdown by severity
+            sev_rows = c.execute("SELECT severity, COUNT(*) FROM iocs GROUP BY severity").fetchall()
+            by_severity = {row[0]: row[1] for row in sev_rows}
+
+            # Feed processing counts
+            feed_rows = c.execute("SELECT feed_id, name, status, ioc_count, weight FROM feeds").fetchall()
+            feeds_summary = [dict(row) for row in feed_rows]
+
+            # Top 10 most recurring indicators
+            top_rows = c.execute(
+                """
+                SELECT value, ioc_type, calculated_score, severity, occurrence_count,
+                       (SELECT COUNT(DISTINCT feed_id) FROM ioc_feed_relations WHERE ioc_id = iocs.ioc_id) as feed_count
+                FROM iocs
+                ORDER BY calculated_score DESC, occurrence_count DESC
+                LIMIT 10
+                """
+            ).fetchall()
+            top_threats = [dict(row) for row in top_rows]
+
+            return {
+                "total_unique_iocs": total_unique,
+                "breakdown_by_type": by_type,
+                "breakdown_by_severity": by_severity,
+                "feeds": feeds_summary,
+                "top_threats": top_threats,
+            }
+
+    # Caching methods
+    def get_cached_enrichment(self, ioc_value: str) -> Optional[Dict[str, Any]]:
+        now_str = utc_now_iso()
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM enrichment_cache WHERE ioc_value = ? AND expires_at > ?",
+                (ioc_value, now_str),
+            ).fetchone()
+            if row:
+                return {
+                    "ioc_value": row["ioc_value"],
+                    "provider": row["provider"],
+                    "reputation_score": row["reputation_score"],
+                    "raw_payload": json.loads(row["raw_payload"]) if row["raw_payload"] else {},
+                    "cached_at": row["cached_at"],
+                    "expires_at": row["expires_at"],
+                }
+            return None
+
+    def set_cached_enrichment(
+        self,
+        ioc_value: str,
+        provider: str,
+        reputation_score: float,
+        raw_payload: dict,
+        ttl_days: int = 7,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(days=ttl_days)
+        with get_db_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO enrichment_cache (ioc_value, provider, reputation_score, raw_payload, cached_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ioc_value) DO UPDATE SET
+                    provider = excluded.provider,
+                    reputation_score = excluded.reputation_score,
+                    raw_payload = excluded.raw_payload,
+                    cached_at = excluded.cached_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    ioc_value,
+                    provider,
+                    reputation_score,
+                    json.dumps(raw_payload),
+                    now.isoformat(),
+                    expires.isoformat(),
+                ),
+            )
+            conn.commit()

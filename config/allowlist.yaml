@@ -1,0 +1,31 @@
+# False-Positive Suppression & Allowlist Configuration
+
+suppression:
+  filter_rfc1918_private_ips: true
+  filter_loopback: true
+  filter_multicast: true
+  filter_link_local: true
+
+safe_ips:
+  - "1.1.1.1"       # Cloudflare DNS
+  - "1.0.0.1"       # Cloudflare DNS
+  - "8.8.8.8"       # Google DNS
+  - "8.8.4.4"       # Google DNS
+  - "9.9.9.9"       # Quad9 DNS
+  - "149.112.112.112" # Quad9 DNS
+  - "208.67.222.222" # OpenDNS
+  - "208.67.220.220" # OpenDNS
+
+safe_domains:
+  - "google.com"
+  - "microsoft.com"
+  - "github.com"
+  - "apple.com"
+  - "amazon.com"
+  - "cloudflare.com"
+  - "windowsupdate.com"
+  - "azure.com"
+  - "aws.amazon.com"
+  - "cdn.jsdelivr.net"
+  - "raw.githubusercontent.com"
+  - "office.com"
