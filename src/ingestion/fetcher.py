@@ -4,8 +4,12 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
-import httpx
 import requests
+
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 from src.models import FeedDefinition
 
@@ -91,6 +95,14 @@ async def fetch_all_feeds_async(
     base_dir: Path,
 ) -> List[Tuple[FeedDefinition, Optional[str], str]]:
     """Concurrently fetches multiple feeds in parallel using asyncio and httpx."""
+    if httpx is None:
+        logger.warning("httpx is not installed; falling back to sequential feed fetching.")
+        results = []
+        for feed in feeds:
+            content, desc = fetch_feed_content(feed, base_dir)
+            results.append((feed, content, desc))
+        return results
+
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         tasks = [fetch_feed_async(feed, base_dir, client) for feed in feeds]
         results = await asyncio.gather(*tasks)

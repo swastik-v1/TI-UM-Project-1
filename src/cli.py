@@ -5,7 +5,6 @@ import logging
 import sys
 from pathlib import Path
 from typing import Optional
-import uvicorn
 
 from src.alerting.dispatcher import WebhookDispatcher
 from src.config_loader import AppConfig, BASE_DIR
@@ -266,10 +265,32 @@ def cmd_stats(config: AppConfig) -> None:
 
 def cmd_serve(config: AppConfig, host: Optional[str] = None, port: Optional[int] = None) -> None:
     """Starts the FastAPI Web Dashboard & REST API server."""
+    try:
+        import uvicorn
+        import fastapi
+    except ImportError as e:
+        print("\n" + "=" * 68)
+        print(" [!] Missing required packages for Web Dashboard (uvicorn / fastapi).")
+        print(f"     Details: {e}")
+        print("=" * 68)
+        print(" You are likely running system Python instead of your project venv.")
+        print("\n Option 1: Run with virtual environment activated:")
+        print("     .\\.venv\\Scripts\\activate")
+        print("     python -m src.cli serve")
+        print("\n Option 2: Run directly using the virtualenv python binary:")
+        print("     .\\.venv\\Scripts\\python.exe -m src.cli serve")
+        print("\n Option 3: Install dependencies into your current Python environment:")
+        print("     pip install -r requirements.txt")
+        print("=" * 68 + "\n")
+        sys.exit(1)
+
     api_cfg = config.api_settings
     h = host or api_cfg["host"]
     p = port or api_cfg["port"]
-    print(f"[+] Starting Threat Intelligence Web Dashboard on http://{h}:{p}")
+    print("=" * 68)
+    print(f" [+] Threat Intelligence Web Dashboard is online!")
+    print(f" [+] Open your browser at: http://{h}:{p}")
+    print("=" * 68)
     uvicorn.run("src.api:app", host=h, port=p, reload=False)
 
 
