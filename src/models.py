@@ -27,6 +27,12 @@ class Severity(str, Enum):
     HIGH = "HIGH"
 
 
+class IndicatorStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    EXPIRED = "EXPIRED"
+    WHITELISTED = "WHITELISTED"
+
+
 @dataclass
 class FeedDefinition:
     id: str
@@ -70,5 +76,7 @@ class ScoredIndicator:
     calculated_score: float
     severity: Severity
     is_whitelisted: bool
+    status: IndicatorStatus = IndicatorStatus.ACTIVE
+    decayed_score: float = 0.0
     sources: List[str] = field(default_factory=list)
     contexts: List[str] = field(default_factory=list)

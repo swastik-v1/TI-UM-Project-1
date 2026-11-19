@@ -1,9 +1,9 @@
-"""SQLite database schema initialization and connection management."""
+"""SQLite database schema initialization, connection management, and auto-migrations."""
 
 from pathlib import Path
 import sqlite3
 
-SCHEMA_SQL = """
+BASE_SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS feeds (
@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS iocs (
     last_seen TIMESTAMP NOT NULL,
     occurrence_count INTEGER DEFAULT 1,
     calculated_score REAL DEFAULT 0.0,
+    decayed_score REAL DEFAULT 0.0,
     severity TEXT DEFAULT 'LOW',
+    status TEXT DEFAULT 'ACTIVE',
     is_whitelisted INTEGER DEFAULT 0
 );
 
@@ -49,11 +51,14 @@ CREATE TABLE IF NOT EXISTS enrichment_cache (
     cached_at TIMESTAMP NOT NULL,
     expires_at TIMESTAMP NOT NULL
 );
+"""
 
+INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_ioc_value ON iocs(value);
 CREATE INDEX IF NOT EXISTS idx_ioc_type ON iocs(ioc_type);
 CREATE INDEX IF NOT EXISTS idx_ioc_severity ON iocs(severity);
 CREATE INDEX IF NOT EXISTS idx_ioc_score ON iocs(calculated_score);
+CREATE INDEX IF NOT EXISTS idx_ioc_status ON iocs(status);
 CREATE INDEX IF NOT EXISTS idx_rel_ioc_feed ON ioc_feed_relations(ioc_id, feed_id);
 """
 
@@ -67,11 +72,26 @@ def get_db_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Safely adds missing columns to existing tables."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(iocs)")
+    existing_cols = {row["name"] for row in cursor.fetchall()}
+
+    if "decayed_score" not in existing_cols:
+        cursor.execute("ALTER TABLE iocs ADD COLUMN decayed_score REAL DEFAULT 0.0")
+    if "status" not in existing_cols:
+        cursor.execute("ALTER TABLE iocs ADD COLUMN status TEXT DEFAULT 'ACTIVE'")
+    conn.commit()
+
+
 def init_db(db_path: Path) -> None:
-    """Initializes the database schema if tables do not exist."""
+    """Initializes the database schema and applies migrations if needed."""
     conn = get_db_connection(db_path)
     try:
-        conn.executescript(SCHEMA_SQL)
+        conn.executescript(BASE_SCHEMA_SQL)
+        _run_migrations(conn)
+        conn.executescript(INDEXES_SQL)
         conn.commit()
     finally:
         conn.close()

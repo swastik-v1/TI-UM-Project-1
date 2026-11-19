@@ -82,6 +82,35 @@ class AppConfig:
         }
 
     @property
+    def retention_settings(self) -> Dict[str, Any]:
+        retention = self.settings_data.get("retention", {})
+        return {
+            "enabled": retention.get("enabled", True),
+            "retention_days": int(retention.get("retention_days", 30)),
+            "decay_scores": retention.get("decay_scores", True),
+            "archive_expired": retention.get("archive_expired", True),
+        }
+
+    @property
+    def webhook_settings(self) -> Dict[str, Any]:
+        hooks = self.settings_data.get("webhooks", {})
+        return {
+            "enabled": hooks.get("enabled", False) or bool(os.getenv("WEBHOOK_URL")),
+            "service_type": hooks.get("service_type", "generic").lower(),
+            "url": os.getenv("WEBHOOK_URL") or hooks.get("url", ""),
+            "min_severity": hooks.get("min_severity", "HIGH").upper(),
+            "min_sources": int(hooks.get("min_sources", 2)),
+        }
+
+    @property
+    def api_settings(self) -> Dict[str, Any]:
+        api = self.settings_data.get("api", {})
+        return {
+            "host": api.get("host", "127.0.0.1"),
+            "port": int(api.get("port", 8000)),
+        }
+
+    @property
     def export_paths(self) -> Dict[str, Path]:
         exports = self.settings_data.get("exports", {})
         return {

@@ -1,7 +1,8 @@
-"""Deterministic scoring algorithm for cross-feed threat intelligence correlation."""
+"""Deterministic scoring and aging decay algorithms for threat correlation."""
 
-from typing import Dict, List
-from src.models import Severity
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple
+from src.models import IndicatorStatus, Severity
 
 
 def calculate_ioc_score(
@@ -32,6 +33,39 @@ def calculate_ioc_score(
         bonus = bonus_mult * (distinct_sources - 1)
 
     return round(base_score + bonus, 2)
+
+
+def calculate_decayed_score(
+    base_score: float,
+    last_seen_iso: str,
+    retention_days: int = 30,
+) -> Tuple[float, IndicatorStatus]:
+    """Calculates TTL decayed score and active/expired status based on elapsed time.
+
+    Decayed Score = Base Score * (1 - days_elapsed / retention_days)
+    """
+    if retention_days <= 0:
+        return base_score, IndicatorStatus.ACTIVE
+
+    try:
+        # Parse ISO string handling both Z and offset
+        cleaned = last_seen_iso.replace("Z", "+00:00")
+        last_dt = datetime.fromisoformat(cleaned)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return base_score, IndicatorStatus.ACTIVE
+
+    now = datetime.now(timezone.utc)
+    elapsed_seconds = max(0.0, (now - last_dt).total_seconds())
+    days_elapsed = elapsed_seconds / 86400.0
+
+    if days_elapsed >= retention_days:
+        return 0.0, IndicatorStatus.EXPIRED
+
+    decay_ratio = 1.0 - (days_elapsed / retention_days)
+    decayed_score = round(base_score * max(0.0, decay_ratio), 2)
+    return decayed_score, IndicatorStatus.ACTIVE
 
 
 def classify_severity(score: float, thresholds: Dict[str, float]) -> Severity:

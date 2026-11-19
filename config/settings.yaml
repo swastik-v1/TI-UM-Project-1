@@ -7,6 +7,23 @@ scoring:
   overlap_bonus_two_sources: 1.5
   overlap_bonus_three_plus: 3.0
 
+retention:
+  enabled: true
+  retention_days: 30
+  decay_scores: true
+  archive_expired: true
+
+webhooks:
+  enabled: false
+  service_type: "generic" # "slack", "teams", "generic"
+  url: ""
+  min_severity: "HIGH"
+  min_sources: 2
+
+api:
+  host: "127.0.0.1"
+  port: 8000
+
 exports:
   firewall_ips: "exports/blocklist_firewall.txt"
   dns_domains: "exports/blocklist_dns.txt"

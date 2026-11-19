@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import List
 
-from src.models import IOCType, ScoredIndicator
+from src.models import IOCType, IndicatorStatus, ScoredIndicator
 
 logger = logging.getLogger("ti_aggregator.exports")
 
@@ -23,7 +23,12 @@ def _filter_by_min_severity(indicators: List[ScoredIndicator], min_severity: str
         "HIGH": {"HIGH"},
     }
     allowed = allowed_map.get(min_severity.upper(), {"HIGH"})
-    return [i for i in indicators if i.severity.value in allowed and not i.is_whitelisted]
+    return [
+        i for i in indicators
+        if i.severity.value in allowed
+        and not i.is_whitelisted
+        and i.status == IndicatorStatus.ACTIVE
+    ]
 
 
 def export_firewall_ips(indicators: List[ScoredIndicator], output_path: Path, min_severity: str = "HIGH") -> int:

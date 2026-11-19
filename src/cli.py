@@ -5,7 +5,9 @@ import logging
 import sys
 from pathlib import Path
 from typing import Optional
+import uvicorn
 
+from src.alerting.dispatcher import WebhookDispatcher
 from src.config_loader import AppConfig, BASE_DIR
 from src.correlation.engine import CorrelationEngine
 from src.enrichment.abuseipdb import AbuseIPDBProvider
@@ -19,7 +21,7 @@ from src.exports.blocklists import (
     export_proxy_urls,
 )
 from src.exports.reporter import generate_threat_report
-from src.ingestion.fetcher import fetch_feed_content
+from src.ingestion.fetcher import fetch_all_feeds
 from src.ingestion.parsers import parse_raw_feed
 from src.normalization.derived import extract_derived_indicators
 from src.normalization.extractors import classify_and_normalize_ioc
@@ -54,14 +56,15 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
         suppression_rules=config.suppression_rules,
     )
 
-    # 3. Fetch & Ingest Feeds
+    # 3. Fetch & Ingest Feeds Concurrently (Async Fetcher)
     feeds = config.get_feeds()
     total_parsed = 0
     total_suppressed = 0
 
-    print(f"\n[+] Ingesting {len(feeds)} configured threat feeds...")
-    for feed in feeds:
-        content, source_desc = fetch_feed_content(feed, BASE_DIR)
+    print(f"\n[+] Concurrently fetching {len(feeds)} threat feeds (async)...")
+    fetched_results = fetch_all_feeds(feeds, BASE_DIR)
+
+    for feed, content, source_desc in fetched_results:
         if not content:
             print(f"    [-] Failed to fetch feed '{feed.name}': {source_desc}")
             repo.record_feed_status(
@@ -84,7 +87,6 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
             if not indicator:
                 continue
 
-            # Check suppression / bogon filter
             should_drop, reason = ioc_filter.should_suppress(indicator)
             if should_drop:
                 total_suppressed += 1
@@ -94,7 +96,6 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
             ingested_count += 1
             total_parsed += 1
 
-            # Check and save derived indicators (e.g. Host/Domain from URL)
             derived_list = extract_derived_indicators(indicator)
             for derived in derived_list:
                 d_drop, _ = ioc_filter.should_suppress(derived)
@@ -118,17 +119,19 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
     print(f"\n[*] Total valid indicators stored: {total_parsed}")
     print(f"[*] Total false positives / bogons suppressed: {total_suppressed}")
 
-    # 4. Correlation & Scoring Engine
-    print("\n[+] Running Correlation & Deterministic Scoring Engine...")
+    # 4. Correlation & Deterministic Scoring Engine with Aging/Decay
+    print("\n[+] Running Correlation, Scoring & TTL Aging Engine...")
     engine = CorrelationEngine(
         repository=repo,
         feeds=feeds,
         thresholds=config.scoring_thresholds,
+        retention_settings=config.retention_settings,
     )
     sev_counts = engine.run_correlation()
-    print(f"    [✓] High Severity:   {sev_counts['HIGH']}")
-    print(f"    [✓] Medium Severity: {sev_counts['MEDIUM']}")
-    print(f"    [✓] Low Severity:    {sev_counts['LOW']}")
+    print(f"    [✓] High Severity:    {sev_counts['HIGH']}")
+    print(f"    [✓] Medium Severity:  {sev_counts['MEDIUM']}")
+    print(f"    [✓] Low Severity:     {sev_counts['LOW']}")
+    print(f"    [✓] Expired (Decayed): {sev_counts['EXPIRED']}")
 
     # 5. Optional Gated Enrichment
     if enrich_high:
@@ -144,9 +147,15 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
             if res:
                 print(f"    [+] Enriched {ioc.value} ({res.provider}): {res.summary}")
 
-    # 6. Generate Blocklists
-    print("\n[+] Generating Defensive Blocklists...")
-    all_scored = repo.get_all_scored_indicators()
+    # 6. Webhook Alerting
+    dispatcher = WebhookDispatcher(config.webhook_settings)
+    alerted = dispatcher.dispatch(repo.get_all_scored_indicators(min_severity="HIGH"))
+    if alerted > 0:
+        print(f"    [✓] Webhook alerts dispatched for {alerted} critical indicators.")
+
+    # 7. Generate Blocklists
+    print("\n[+] Generating Defensive Blocklists (Active IOCs only)...")
+    all_scored = repo.get_all_scored_indicators(status="ACTIVE")
     paths = config.export_paths
     min_sevs = config.export_min_severities
 
@@ -162,7 +171,7 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
     print(f"    [✓] EDR Hash Watchlist:  {edr_count} Hashes -> {paths['edr_hashes'].name}")
     print(f"    [✓] Full JSON Feed:      {json_count} IOCs -> {paths['all_json'].name}")
 
-    # 7. Generate Executive Report
+    # 8. Generate Executive Report
     print("\n[+] Generating Executive Intelligence Report...")
     metrics = repo.get_metrics()
     report_file = paths["summary_report"]
@@ -191,8 +200,10 @@ def cmd_lookup(config: AppConfig, ioc_val: str, enrich: bool = False) -> None:
     print(f"   INDICATOR DETAILS: {ioc.value}")
     print("=" * 60)
     print(f" Type:             {ioc.ioc_type.value}")
+    print(f" Status:           {ioc.status.value}")
     print(f" Severity:         {ioc.severity.value}")
     print(f" Composite Score:  {ioc.calculated_score}")
+    print(f" Decayed Score:    {ioc.decayed_score}")
     print(f" Occurrence Count: {ioc.occurrence_count}")
     print(f" First Seen:       {ioc.first_seen}")
     print(f" Last Seen:        {ioc.last_seen}")
@@ -236,17 +247,30 @@ def cmd_stats(config: AppConfig) -> None:
     for k, v in metrics["breakdown_by_type"].items():
         print(f"  {k:<12}: {v}")
 
-    print("\n[Breakdown by Severity]")
+    print("\n[Breakdown by Severity (Active)]")
     for k, v in metrics["breakdown_by_severity"].items():
+        print(f"  {k:<12}: {v}")
+
+    print("\n[Breakdown by Status (TTL Aging)]")
+    for k, v in metrics.get("breakdown_by_status", {}).items():
         print(f"  {k:<12}: {v}")
 
     print("\n[Ingested Feeds]")
     for f in metrics["feeds"]:
         print(f"  - {f['name']} ({f['feed_id']}): {f['ioc_count']} IOCs (Status: {f['status']})")
 
-    print("\n[Top 5 High-Risk Indicators]")
+    print("\n[Top 5 High-Risk Active Indicators]")
     for t in metrics["top_threats"][:5]:
-        print(f"  - {t['value']} [{t['ioc_type']}] | Score: {t['calculated_score']} | Feeds: {t['feed_count']}")
+        print(f"  - {t['value']} [{t['ioc_type']}] | Score: {t['calculated_score']} (Decayed: {t.get('decayed_score', t['calculated_score'])}) | Feeds: {t['feed_count']}")
+
+
+def cmd_serve(config: AppConfig, host: Optional[str] = None, port: Optional[int] = None) -> None:
+    """Starts the FastAPI Web Dashboard & REST API server."""
+    api_cfg = config.api_settings
+    h = host or api_cfg["host"]
+    p = port or api_cfg["port"]
+    print(f"[+] Starting Threat Intelligence Web Dashboard on http://{h}:{p}")
+    uvicorn.run("src.api:app", host=h, port=p, reload=False)
 
 
 def main():
@@ -265,6 +289,11 @@ def main():
     lookup_parser.add_argument("ioc", help="Indicator string to search for (IP, Domain, URL, Hash, Email)")
     lookup_parser.add_argument("--enrich", action="store_true", help="Cross-check with external APIs")
 
+    # Command: serve
+    serve_parser = subparsers.add_parser("serve", help="Start the FastAPI REST API & Interactive Web Dashboard")
+    serve_parser.add_argument("--host", default=None, help="Host address (default 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=None, help="Port number (default 8000)")
+
     args = parser.parse_args()
     config = AppConfig()
 
@@ -274,6 +303,8 @@ def main():
         cmd_stats(config)
     elif args.command == "lookup":
         cmd_lookup(config, args.ioc, enrich=args.enrich)
+    elif args.command == "serve":
+        cmd_serve(config, host=args.host, port=args.port)
     else:
         parser.print_help()
 

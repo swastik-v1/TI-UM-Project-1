@@ -1,4 +1,4 @@
-"""Database repository handling CRUD operations, upserts, and analytics."""
+"""Database repository handling CRUD operations, upserts, aging, and analytics."""
 
 from datetime import datetime, timezone, timedelta
 import json
@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import sqlite3
 
-from src.models import IOCType, ParsedIndicator, ScoredIndicator, Severity
+from src.models import IOCType, IndicatorStatus, ParsedIndicator, ScoredIndicator, Severity
 from src.storage.database import get_db_connection
 
 
@@ -70,20 +70,19 @@ class IOCRepository:
             ioc_id (int)
         """
         now_str = indicator.timestamp.isoformat()
-        # Ensure parent feed exists before inserting relation
         self.ensure_feed_exists(indicator.feed_id)
 
         with get_db_connection(self.db_path) as conn:
             cursor = conn.cursor()
 
-            # Insert or update indicator
             cursor.execute(
                 """
-                INSERT INTO iocs (value, ioc_type, first_seen, last_seen, occurrence_count)
-                VALUES (?, ?, ?, ?, 1)
+                INSERT INTO iocs (value, ioc_type, first_seen, last_seen, occurrence_count, status)
+                VALUES (?, ?, ?, ?, 1, 'ACTIVE')
                 ON CONFLICT(value) DO UPDATE SET
                     last_seen = excluded.last_seen,
-                    occurrence_count = iocs.occurrence_count + 1
+                    occurrence_count = iocs.occurrence_count + 1,
+                    status = 'ACTIVE'
                 RETURNING ioc_id
                 """,
                 (indicator.value, indicator.ioc_type.value, now_str, now_str),
@@ -91,7 +90,6 @@ class IOCRepository:
             row = cursor.fetchone()
             ioc_id = row[0]
 
-            # Upsert relation with feed
             cursor.execute(
                 """
                 INSERT INTO ioc_feed_relations (ioc_id, feed_id, raw_context, observed_at)
@@ -119,6 +117,7 @@ class IOCRepository:
                 i.last_seen,
                 i.occurrence_count,
                 i.is_whitelisted,
+                i.status,
                 GROUP_CONCAT(DISTINCT r.feed_id) AS feed_ids,
                 GROUP_CONCAT(DISTINCT r.raw_context) AS contexts,
                 COUNT(DISTINCT r.feed_id) AS distinct_feed_count
@@ -141,6 +140,7 @@ class IOCRepository:
                     "last_seen": r["last_seen"],
                     "occurrence_count": r["occurrence_count"],
                     "is_whitelisted": bool(r["is_whitelisted"]),
+                    "status": r["status"] if "status" in r.keys() else "ACTIVE",
                     "feed_ids": feed_ids,
                     "contexts": contexts,
                     "distinct_feed_count": r["distinct_feed_count"],
@@ -148,7 +148,7 @@ class IOCRepository:
             return results
 
     def batch_update_scores(self, updates: List[Tuple[float, str, int]]) -> None:
-        """Updates score and severity in batch: [(score, severity_str, ioc_id), ...]"""
+        """Updates score and severity: [(score, severity_str, ioc_id), ...]"""
         if not updates:
             return
         with get_db_connection(self.db_path) as conn:
@@ -158,10 +158,31 @@ class IOCRepository:
             )
             conn.commit()
 
+    def batch_update_scores_with_decay(
+        self, updates: List[Tuple[float, float, str, str, int]]
+    ) -> None:
+        """Updates scores with aging decay: [(score, decayed_score, severity, status, ioc_id), ...]"""
+        if not updates:
+            return
+        with get_db_connection(self.db_path) as conn:
+            conn.executemany(
+                """
+                UPDATE iocs
+                SET calculated_score = ?,
+                    decayed_score = ?,
+                    severity = ?,
+                    status = ?
+                WHERE ioc_id = ?
+                """,
+                updates,
+            )
+            conn.commit()
+
     def get_all_scored_indicators(
         self,
         min_severity: Optional[str] = None,
         ioc_type: Optional[IOCType] = None,
+        status: Optional[str] = "ACTIVE",
     ) -> List[ScoredIndicator]:
         """Fetches scored indicators with optional filters."""
         query = """
@@ -173,7 +194,9 @@ class IOCRepository:
                 i.last_seen,
                 i.occurrence_count,
                 i.calculated_score,
+                i.decayed_score,
                 i.severity,
+                i.status,
                 i.is_whitelisted,
                 GROUP_CONCAT(DISTINCT r.feed_id) AS feed_ids,
                 GROUP_CONCAT(DISTINCT r.raw_context) AS contexts
@@ -182,6 +205,10 @@ class IOCRepository:
             WHERE 1=1
         """
         params = []
+        if status and status.upper() != "ALL":
+            query += " AND i.status = ?"
+            params.append(status.upper())
+
         if min_severity:
             sev_levels = {"LOW": ["LOW", "MEDIUM", "HIGH"], "MEDIUM": ["MEDIUM", "HIGH"], "HIGH": ["HIGH"]}
             allowed = sev_levels.get(min_severity.upper(), ["HIGH"])
@@ -202,6 +229,7 @@ class IOCRepository:
             for r in rows:
                 sources = [s.strip() for s in (r["feed_ids"] or "").split(",") if s.strip()]
                 contexts = [c.strip() for c in (r["contexts"] or "").split(",") if c.strip()]
+                status_val = r["status"] if "status" in r.keys() and r["status"] else "ACTIVE"
                 indicators.append(
                     ScoredIndicator(
                         ioc_id=r["ioc_id"],
@@ -211,7 +239,9 @@ class IOCRepository:
                         last_seen=r["last_seen"],
                         occurrence_count=r["occurrence_count"],
                         calculated_score=float(r["calculated_score"]),
+                        decayed_score=float(r["decayed_score"]) if "decayed_score" in r.keys() and r["decayed_score"] is not None else float(r["calculated_score"]),
                         severity=Severity(r["severity"]),
+                        status=IndicatorStatus(status_val),
                         is_whitelisted=bool(r["is_whitelisted"]),
                         sources=sources,
                         contexts=contexts,
@@ -230,7 +260,9 @@ class IOCRepository:
                 i.last_seen,
                 i.occurrence_count,
                 i.calculated_score,
+                i.decayed_score,
                 i.severity,
+                i.status,
                 i.is_whitelisted,
                 GROUP_CONCAT(DISTINCT r.feed_id) AS feed_ids,
                 GROUP_CONCAT(DISTINCT r.raw_context) AS contexts
@@ -246,6 +278,7 @@ class IOCRepository:
                 return None
             sources = [s.strip() for s in (r["feed_ids"] or "").split(",") if s.strip()]
             contexts = [c.strip() for c in (r["contexts"] or "").split(",") if c.strip()]
+            status_val = r["status"] if "status" in r.keys() and r["status"] else "ACTIVE"
             return ScoredIndicator(
                 ioc_id=r["ioc_id"],
                 value=r["value"],
@@ -254,7 +287,9 @@ class IOCRepository:
                 last_seen=r["last_seen"],
                 occurrence_count=r["occurrence_count"],
                 calculated_score=float(r["calculated_score"]),
+                decayed_score=float(r["decayed_score"]) if "decayed_score" in r.keys() and r["decayed_score"] is not None else float(r["calculated_score"]),
                 severity=Severity(r["severity"]),
+                status=IndicatorStatus(status_val),
                 is_whitelisted=bool(r["is_whitelisted"]),
                 sources=sources,
                 contexts=contexts,
@@ -272,19 +307,24 @@ class IOCRepository:
             by_type = {row[0]: row[1] for row in type_rows}
 
             # Breakdown by severity
-            sev_rows = c.execute("SELECT severity, COUNT(*) FROM iocs GROUP BY severity").fetchall()
+            sev_rows = c.execute("SELECT severity, COUNT(*) FROM iocs WHERE status = 'ACTIVE' GROUP BY severity").fetchall()
             by_severity = {row[0]: row[1] for row in sev_rows}
+
+            # Breakdown by status
+            status_rows = c.execute("SELECT status, COUNT(*) FROM iocs GROUP BY status").fetchall()
+            by_status = {row[0]: row[1] for row in status_rows}
 
             # Feed processing counts
             feed_rows = c.execute("SELECT feed_id, name, status, ioc_count, weight FROM feeds").fetchall()
             feeds_summary = [dict(row) for row in feed_rows]
 
-            # Top 10 most recurring indicators
+            # Top 10 active threats
             top_rows = c.execute(
                 """
-                SELECT value, ioc_type, calculated_score, severity, occurrence_count,
+                SELECT value, ioc_type, calculated_score, decayed_score, severity, status, occurrence_count,
                        (SELECT COUNT(DISTINCT feed_id) FROM ioc_feed_relations WHERE ioc_id = iocs.ioc_id) as feed_count
                 FROM iocs
+                WHERE status = 'ACTIVE'
                 ORDER BY calculated_score DESC, occurrence_count DESC
                 LIMIT 10
                 """
@@ -295,6 +335,7 @@ class IOCRepository:
                 "total_unique_iocs": total_unique,
                 "breakdown_by_type": by_type,
                 "breakdown_by_severity": by_severity,
+                "breakdown_by_status": by_status,
                 "feeds": feeds_summary,
                 "top_threats": top_threats,
             }
