@@ -25,7 +25,7 @@ def generate_threat_report(
     feeds = metrics.get("feeds", [])
 
     lines = [
-        "# Threat Intelligence Aggregator - Executive Intelligence Report",
+        "# ThreatForge - Executive Threat Intelligence Report",
         "",
         f"**Generated:** {generated_time}  ",
         f"**Pipeline Mode:** Rules-Based Deterministic (No AI/ML)  ",
@@ -35,7 +35,7 @@ def generate_threat_report(
         "",
         "## 1. Executive Summary & Key Metrics",
         "",
-        f"During this aggregation cycle, the Threat Intelligence Aggregator parsed, normalized, and correlated indicators across all configured internal and external threat feeds.",
+        f"During this aggregation cycle, ThreatForge parsed, normalized, and correlated indicators across all configured internal and external threat feeds.",
         "",
         f"- **Total Unique Indicators of Compromise (IOCs):** `{total_iocs}`",
         f"- **High Severity Indicators (Active Block Candidates):** `{by_sev.get('HIGH', 0)}`",

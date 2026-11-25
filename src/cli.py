@@ -3,6 +3,7 @@
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -13,15 +14,18 @@ from src.enrichment.abuseipdb import AbuseIPDBProvider
 from src.enrichment.cache import EnrichmentManager
 from src.enrichment.virustotal import VirusTotalProvider
 from src.exports.blocklists import (
+    calculate_blocklist_diff,
     export_dns_domains,
     export_edr_hashes,
     export_firewall_ips,
     export_full_json,
     export_proxy_urls,
+    export_stix_bundle,
 )
 from src.exports.reporter import generate_threat_report
 from src.ingestion.fetcher import fetch_all_feeds
 from src.ingestion.parsers import parse_raw_feed
+from src.models import IndicatorStatus
 from src.normalization.derived import extract_derived_indicators
 from src.normalization.extractors import classify_and_normalize_ioc
 from src.normalization.filter import IOCFilter
@@ -39,7 +43,7 @@ logger = logging.getLogger("ti_aggregator.cli")
 def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
     """Executes the complete threat intelligence aggregation cycle."""
     print("=" * 70)
-    print("   THREAT INTELLIGENCE AGGREGATOR - PIPELINE EXECUTION")
+    print("   THREATFORGE - THREAT INTELLIGENCE PIPELINE EXECUTION")
     print("=" * 70)
 
     # 1. Initialize Storage
@@ -48,19 +52,24 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
     repo = IOCRepository(db_path)
     print(f"[*] Initialized SQLite database at: {db_path.name}")
 
-    # 2. Setup Filter
+    # 2. Setup Filter with Static + Dynamic Allowlists
     ioc_filter = IOCFilter(
         safe_ips=config.safe_ips,
         safe_domains=config.safe_domains,
         suppression_rules=config.suppression_rules,
     )
+    dynamic_allow = repo.get_dynamic_allowlist()
+    for ip in dynamic_allow.get("ips", set()):
+        ioc_filter.add_safe_ip(ip)
+    for dom in dynamic_allow.get("domains", set()):
+        ioc_filter.add_safe_domain(dom)
 
-    # 3. Fetch & Ingest Feeds Concurrently (Async Fetcher)
+    # 3. Fetch & Ingest Feeds Concurrently (Async Fetcher with Resilience)
     feeds = config.get_feeds()
     total_parsed = 0
     total_suppressed = 0
 
-    print(f"\n[+] Concurrently fetching {len(feeds)} threat feeds (async)...")
+    print(f"\n[+] Concurrently fetching {len(feeds)} threat feeds (async with circuit breakers)...")
     fetched_results = fetch_all_feeds(feeds, BASE_DIR)
 
     for feed, content, source_desc in fetched_results:
@@ -118,13 +127,14 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
     print(f"\n[*] Total valid indicators stored: {total_parsed}")
     print(f"[*] Total false positives / bogons suppressed: {total_suppressed}")
 
-    # 4. Correlation & Deterministic Scoring Engine with Aging/Decay
-    print("\n[+] Running Correlation, Scoring & TTL Aging Engine...")
+    # 4. Correlation, Deterministic Scoring, Heuristics & TTL Aging
+    print("\n[+] Running Correlation, Heuristics (DGA/Subnet) & TTL Aging Engine...")
     engine = CorrelationEngine(
         repository=repo,
         feeds=feeds,
         thresholds=config.scoring_thresholds,
         retention_settings=config.retention_settings,
+        heuristic_settings=config.heuristic_settings,
     )
     sev_counts = engine.run_correlation()
     print(f"    [✓] High Severity:    {sev_counts['HIGH']}")
@@ -152,8 +162,8 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
     if alerted > 0:
         print(f"    [✓] Webhook alerts dispatched for {alerted} critical indicators.")
 
-    # 7. Generate Blocklists
-    print("\n[+] Generating Defensive Blocklists (Active IOCs only)...")
+    # 7. Generate Blocklists & Snapshot Diff
+    print("\n[+] Generating Defensive Blocklists & STIX 2.1 Bundle (Active IOCs only)...")
     all_scored = repo.get_all_scored_indicators(status="ACTIVE")
     paths = config.export_paths
     min_sevs = config.export_min_severities
@@ -163,12 +173,19 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
     proxy_count = export_proxy_urls(all_scored, paths["proxy_urls"], min_sevs["proxy"])
     edr_count = export_edr_hashes(all_scored, paths["edr_hashes"], min_sevs["edr"])
     json_count = export_full_json(all_scored, paths["all_json"])
+    stix_count = export_stix_bundle(all_scored, paths["stix_bundle"])
+
+    # Record snapshot for dry-run/diff tracking
+    active_values = [i.value for i in all_scored if i.status == IndicatorStatus.ACTIVE]
+    repo.save_blocklist_snapshot(active_values)
+    repo.record_audit_log("PIPELINE_RUN", "all", f"Exported {len(active_values)} active IOCs")
 
     print(f"    [✓] Firewall Blocklist:  {fw_count} IPs -> {paths['firewall_ips'].name}")
     print(f"    [✓] DNS Sinkhole List:   {dns_count} Domains -> {paths['dns_domains'].name}")
     print(f"    [✓] Web Proxy Filter:    {proxy_count} URLs -> {paths['proxy_urls'].name}")
     print(f"    [✓] EDR Hash Watchlist:  {edr_count} Hashes -> {paths['edr_hashes'].name}")
     print(f"    [✓] Full JSON Feed:      {json_count} IOCs -> {paths['all_json'].name}")
+    print(f"    [✓] STIX 2.1 Bundle:     {stix_count} Objects -> {paths['stix_bundle'].name}")
 
     # 8. Generate Executive Report
     print("\n[+] Generating Executive Intelligence Report...")
@@ -180,6 +197,42 @@ def run_full_pipeline(config: AppConfig, enrich_high: bool = False) -> None:
     print("\n" + "=" * 70)
     print("   PIPELINE COMPLETE - BLOCKLISTS READY FOR DEPLOYMENT")
     print("=" * 70)
+
+
+def cmd_diff(config: AppConfig) -> None:
+    """Calculates diff between current active indicators and previous export snapshot."""
+    db_path = config.database_path
+    if not db_path.is_file():
+        print(f"[-] Database not found at {db_path}.")
+        return
+
+    repo = IOCRepository(db_path)
+    current_active = repo.get_all_scored_indicators(status="ACTIVE")
+    previous_snapshot = repo.get_latest_blocklist_snapshot()
+
+    diff = calculate_blocklist_diff(current_active, previous_snapshot)
+
+    print("=" * 65)
+    print("   BLOCKLIST PREVIEW & DRY-RUN DIFF REPORT")
+    print("=" * 65)
+    print(f" Total Active Indicators:   {diff['total_active']}")
+    print(f" Newly Added Threats:       +{diff['added_count']}")
+    print(f" Expired / Removed Threats: -{diff['removed_or_expired_count']}")
+    print(f" Unchanged Indicators:      {diff['unchanged_count']}")
+
+    if diff["added"]:
+        print("\n[+] Newly Added Indicators:")
+        for item in diff["added"][:10]:
+            print(f"    + {item['value']} [{item['type']}] (Score: {item['score']}, {item['severity']})")
+        if len(diff["added"]) > 10:
+            print(f"    ... and {len(diff['added']) - 10} more")
+
+    if diff["removed_or_expired"]:
+        print("\n[-] Expired / Dropped Indicators:")
+        for val in diff["removed_or_expired"][:10]:
+            print(f"    - {val}")
+        if len(diff["removed_or_expired"]) > 10:
+            print(f"    ... and {len(diff['removed_or_expired']) - 10} more")
 
 
 def cmd_lookup(config: AppConfig, ioc_val: str, enrich: bool = False) -> None:
@@ -239,7 +292,7 @@ def cmd_stats(config: AppConfig) -> None:
     metrics = repo.get_metrics()
 
     print("=" * 60)
-    print("   THREAT INTELLIGENCE AGGREGATOR - DATABASE METRICS")
+    print("   THREATFORGE - DATABASE METRICS & INDICATOR STATUS")
     print("=" * 60)
     print(f"Total Unique Indicators: {metrics['total_unique_iocs']}")
     print("\n[Breakdown by Type]")
@@ -294,13 +347,22 @@ def cmd_serve(config: AppConfig, host: Optional[str] = None, port: Optional[int]
     uvicorn.run("src.api:app", host=h, port=p, reload=False)
 
 
+def cmd_scheduler(config: AppConfig, interval_minutes: int = 60) -> None:
+    """Runs periodic background aggregation worker."""
+    from src.scheduler import run_scheduler_loop
+    run_scheduler_loop(config, interval_minutes=interval_minutes)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Threat Intelligence Aggregator CLI")
+    parser = argparse.ArgumentParser(description="ThreatForge - Cyber Threat Intelligence Platform CLI")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
     # Command: run
     run_parser = subparsers.add_parser("run", help="Run the full ingestion, correlation, and export pipeline")
     run_parser.add_argument("--enrich", action="store_true", help="Perform gated API enrichment on high-severity IOCs")
+
+    # Command: diff
+    subparsers.add_parser("diff", help="Display dry-run diff between current active threats and previous export")
 
     # Command: stats
     subparsers.add_parser("stats", help="Display summary metrics of the threat intelligence database")
@@ -315,17 +377,25 @@ def main():
     serve_parser.add_argument("--host", default=None, help="Host address (default 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=None, help="Port number (default 8000)")
 
+    # Command: scheduler
+    sched_parser = subparsers.add_parser("scheduler", help="Run automated background scheduling worker")
+    sched_parser.add_argument("--interval", type=int, default=60, help="Polling interval in minutes (default 60)")
+
     args = parser.parse_args()
     config = AppConfig()
 
     if args.command == "run" or args.command is None:
         run_full_pipeline(config, enrich_high=getattr(args, "enrich", False))
+    elif args.command == "diff":
+        cmd_diff(config)
     elif args.command == "stats":
         cmd_stats(config)
     elif args.command == "lookup":
         cmd_lookup(config, args.ioc, enrich=args.enrich)
     elif args.command == "serve":
         cmd_serve(config, host=args.host, port=args.port)
+    elif args.command == "scheduler":
+        cmd_scheduler(config, interval_minutes=args.interval)
     else:
         parser.print_help()
 

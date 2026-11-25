@@ -33,3 +33,11 @@ feeds:
     format: "json"
     weight: 5.0
     description: "Internal security incidents, honeypot captures, and verified forensic IOCs."
+
+  - id: "stix2_bundle_feed"
+    name: "OASIS STIX 2.1 Threat Intel Feed"
+    source_type: "file"
+    path: "data/samples/stix2_sample.json"
+    format: "stix"
+    weight: 4.5
+    description: "Standardized STIX 2.1 bundle containing observable patterns and threat indicators."

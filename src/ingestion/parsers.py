@@ -4,7 +4,8 @@ import csv
 import io
 import json
 import logging
-from typing import List
+import re
+from typing import Any, List
 from src.models import RawCandidate
 
 logger = logging.getLogger("ti_aggregator.parsers")
@@ -16,6 +17,8 @@ COMMON_INDICATOR_KEYS = {
 
 CONTEXT_KEYS = {"malware", "threat", "tags", "notes", "reporter", "description", "status"}
 
+RE_STIX_PATTERN = re.compile(r"\[([a-zA-Z0-9_\-\.\:\'\"]+)\s*=\s*['\"]([^'\"]+)['\"]\]")
+
 
 def parse_raw_feed(content: str, feed_format: str, feed_id: str) -> List[RawCandidate]:
     """Parses raw feed text into a list of RawCandidate objects."""
@@ -23,12 +26,81 @@ def parse_raw_feed(content: str, feed_format: str, feed_id: str) -> List[RawCand
         return []
 
     format_lower = feed_format.lower().strip()
-    if format_lower == "json":
+    if format_lower in ("stix", "stix2", "stix2.1"):
+        return _parse_stix(content, feed_id)
+    elif format_lower == "json":
         return _parse_json(content, feed_id)
     elif format_lower == "csv":
         return _parse_csv(content, feed_id)
     else:
         return _parse_txt(content, feed_id)
+
+
+def _parse_stix(content: str, feed_id: str) -> List[RawCandidate]:
+    """Parses STIX 2.1 JSON bundles and extracts indicator objects and observable patterns."""
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict) and data.get("type") == "bundle":
+            return _parse_stix_bundle(data, feed_id)
+        elif isinstance(data, list):
+            candidates = []
+            for item in data:
+                if isinstance(item, dict) and item.get("type") == "bundle":
+                    candidates.extend(_parse_stix_bundle(item, feed_id))
+            return candidates
+    except Exception as e:
+        logger.error("Failed to parse STIX bundle for feed %s: %s", feed_id, e)
+    return []
+
+
+def _parse_stix_bundle(bundle: dict, feed_id: str) -> List[RawCandidate]:
+    candidates = []
+    objects = bundle.get("objects", [])
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+
+        obj_type = obj.get("type")
+
+        # 1. Indicator object with STIX pattern
+        if obj_type == "indicator":
+            pattern = obj.get("pattern", "")
+            matches = RE_STIX_PATTERN.findall(pattern)
+            ctx_items = []
+            if obj.get("name"):
+                ctx_items.append(f"name:{obj['name']}")
+            if obj.get("description"):
+                ctx_items.append(f"desc:{obj['description']}")
+            if obj.get("confidence") is not None:
+                ctx_items.append(f"confidence:{obj['confidence']}")
+            if obj.get("labels"):
+                ctx_items.append(f"labels:{';'.join(obj['labels'])}")
+            ctx_str = ", ".join(ctx_items)
+
+            for target_field, val in matches:
+                candidates.append(RawCandidate(raw_value=val.strip(), feed_id=feed_id, context=ctx_str))
+
+        # 2. Cyber Observable Objects (SCOs)
+        elif obj_type in ("ipv4-addr", "ipv6-addr", "domain-name", "url", "email-addr"):
+            val = obj.get("value")
+            if val:
+                candidates.append(RawCandidate(raw_value=str(val).strip(), feed_id=feed_id, context=f"stix_sco:{obj_type}"))
+
+        elif obj_type == "file":
+            hashes = obj.get("hashes", {})
+            for h_algo, h_val in hashes.items():
+                candidates.append(RawCandidate(raw_value=str(h_val).strip(), feed_id=feed_id, context=f"stix_file_hash:{h_algo}"))
+
+        # 3. observed-data
+        elif obj_type == "observed-data":
+            scoped_objs = obj.get("objects", {})
+            if isinstance(scoped_objs, dict):
+                for _, s_obj in scoped_objs.items():
+                    if isinstance(s_obj, dict):
+                        val = s_obj.get("value")
+                        if val:
+                            candidates.append(RawCandidate(raw_value=str(val).strip(), feed_id=feed_id, context=f"observed:{s_obj.get('type')}"))
+    return candidates
 
 
 def _parse_txt(content: str, feed_id: str) -> List[RawCandidate]:
@@ -99,6 +171,9 @@ def _parse_json(content: str, feed_id: str) -> List[RawCandidate]:
     except Exception as e:
         logger.error("Failed to parse JSON for feed %s: %s", feed_id, e)
         return []
+
+    if isinstance(data, dict) and data.get("type") == "bundle":
+        return _parse_stix_bundle(data, feed_id)
 
     if isinstance(data, list):
         for item in data:

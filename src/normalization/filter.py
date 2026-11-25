@@ -12,12 +12,18 @@ logger = logging.getLogger("ti_aggregator.filter")
 
 class IOCFilter:
     def __init__(self, safe_ips: Set[str], safe_domains: Set[str], suppression_rules: dict):
-        self.safe_ips = safe_ips
-        self.safe_domains = safe_domains
+        self.safe_ips = set(safe_ips)
+        self.safe_domains = {d.lower().strip() for d in safe_domains}
         self.filter_rfc1918 = suppression_rules.get("filter_rfc1918_private_ips", True)
         self.filter_loopback = suppression_rules.get("filter_loopback", True)
         self.filter_multicast = suppression_rules.get("filter_multicast", True)
         self.filter_link_local = suppression_rules.get("filter_link_local", True)
+
+    def add_safe_ip(self, ip_str: str) -> None:
+        self.safe_ips.add(ip_str.strip())
+
+    def add_safe_domain(self, domain_str: str) -> None:
+        self.safe_domains.add(domain_str.lower().strip())
 
     def is_bogon_ip(self, ip_str: str) -> Tuple[bool, str]:
         """Checks if an IP address belongs to private/bogon ranges."""

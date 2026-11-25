@@ -1,4 +1,4 @@
-"""SQLite database schema initialization, connection management, and auto-migrations."""
+"""SQLite database schema initialization, WAL concurrency mode, connection management, and auto-migrations."""
 
 from pathlib import Path
 import sqlite3
@@ -51,6 +51,30 @@ CREATE TABLE IF NOT EXISTS enrichment_cache (
     cached_at TIMESTAMP NOT NULL,
     expires_at TIMESTAMP NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    details TEXT,
+    user TEXT DEFAULT 'analyst'
+);
+
+CREATE TABLE IF NOT EXISTS blocklist_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TIMESTAMP NOT NULL,
+    total_iocs INTEGER NOT NULL,
+    iocs_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dynamic_allowlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_type TEXT NOT NULL, -- 'ip' or 'domain'
+    value TEXT UNIQUE NOT NULL,
+    added_at TIMESTAMP NOT NULL,
+    reason TEXT
+);
 """
 
 INDEXES_SQL = """
@@ -60,20 +84,28 @@ CREATE INDEX IF NOT EXISTS idx_ioc_severity ON iocs(severity);
 CREATE INDEX IF NOT EXISTS idx_ioc_score ON iocs(calculated_score);
 CREATE INDEX IF NOT EXISTS idx_ioc_status ON iocs(status);
 CREATE INDEX IF NOT EXISTS idx_rel_ioc_feed ON ioc_feed_relations(ioc_id, feed_id);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(timestamp);
 """
 
 
 def get_db_connection(db_path: Path) -> sqlite3.Connection:
-    """Returns a sqlite3 connection configured with dict-like row access."""
+    """Returns a sqlite3 connection configured with dict-like row access, WAL mode, and busy timeout."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    # Enable WAL mode for multi-worker concurrency (allows simultaneous reader/writer)
+    try:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA busy_timeout = 10000;")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
-    """Safely adds missing columns to existing tables."""
+    """Safely adds missing columns and tables to existing databases."""
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(iocs)")
     existing_cols = {row["name"] for row in cursor.fetchall()}
@@ -82,6 +114,41 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         cursor.execute("ALTER TABLE iocs ADD COLUMN decayed_score REAL DEFAULT 0.0")
     if "status" not in existing_cols:
         cursor.execute("ALTER TABLE iocs ADD COLUMN status TEXT DEFAULT 'ACTIVE'")
+
+    # Ensure auxiliary tables exist
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            details TEXT,
+            user TEXT DEFAULT 'analyst'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS blocklist_snapshots (
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TIMESTAMP NOT NULL,
+            total_iocs INTEGER NOT NULL,
+            iocs_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dynamic_allowlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_type TEXT NOT NULL,
+            value TEXT UNIQUE NOT NULL,
+            added_at TIMESTAMP NOT NULL,
+            reason TEXT
+        )
+        """
+    )
     conn.commit()
 
 

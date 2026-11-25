@@ -3,7 +3,7 @@
 from datetime import datetime, timezone, timedelta
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import sqlite3
 
 from src.models import IOCType, IndicatorStatus, ParsedIndicator, ScoredIndicator, Severity
@@ -392,3 +392,122 @@ class IOCRepository:
                 ),
             )
             conn.commit()
+
+    # Audit Logging
+    def record_audit_log(self, action: str, target: str, details: str = "", user: str = "analyst") -> None:
+        """Records an action in the audit trail."""
+        now = utc_now_iso()
+        with get_db_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_logs (timestamp, action, target, details, user)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (now, action, target, details, user),
+            )
+            conn.commit()
+
+    def get_audit_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieves recent audit log events."""
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute(
+                "SELECT * FROM audit_logs ORDER BY log_id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    # Blocklist Snapshots for Diff Previews
+    def save_blocklist_snapshot(self, active_ioc_values: List[str]) -> int:
+        """Saves current exported IOC values to compute diffs in subsequent runs."""
+        now = utc_now_iso()
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO blocklist_snapshots (created_at, total_iocs, iocs_json)
+                VALUES (?, ?, ?)
+                RETURNING snapshot_id
+                """,
+                (now, len(active_ioc_values), json.dumps(active_ioc_values)),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+            return row[0]
+
+    def get_latest_blocklist_snapshot(self) -> Set[str]:
+        """Returns the set of active IOC values from the most recent export snapshot."""
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT iocs_json FROM blocklist_snapshots ORDER BY snapshot_id DESC LIMIT 1"
+            ).fetchone()
+            if row and row["iocs_json"]:
+                try:
+                    return set(json.loads(row["iocs_json"]))
+                except Exception:
+                    return set()
+            return set()
+
+    # Feed Management
+    def get_all_feeds(self) -> List[Dict[str, Any]]:
+        """Returns all configured feeds and their live statuses."""
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("SELECT * FROM feeds ORDER BY feed_id ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    def update_feed_config(self, feed_id: str, status: Optional[str] = None, weight: Optional[float] = None) -> bool:
+        """Updates feed enabled status or confidence weight."""
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            if status is not None and weight is not None:
+                cursor.execute("UPDATE feeds SET status = ?, weight = ? WHERE feed_id = ?", (status, weight, feed_id))
+            elif status is not None:
+                cursor.execute("UPDATE feeds SET status = ? WHERE feed_id = ?", (status, feed_id))
+            elif weight is not None:
+                cursor.execute("UPDATE feeds SET weight = ? WHERE feed_id = ?", (weight, feed_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # Dynamic Allowlist Management
+    def add_dynamic_allowlist(self, entry_type: str, value: str, reason: str = "") -> bool:
+        """Adds an IP or domain to the dynamic allowlist."""
+        now = utc_now_iso()
+        val_clean = value.lower().strip()
+        with get_db_connection(self.db_path) as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO dynamic_allowlist (entry_type, value, added_at, reason)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(value) DO UPDATE SET reason = excluded.reason
+                    """,
+                    (entry_type.lower(), val_clean, now, reason),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                return False
+
+    def remove_dynamic_allowlist(self, value: str) -> bool:
+        """Removes an indicator from the dynamic allowlist."""
+        val_clean = value.lower().strip()
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM dynamic_allowlist WHERE value = ?", (val_clean,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_dynamic_allowlist(self) -> Dict[str, Set[str]]:
+        """Returns dynamic safe IPs and safe domains from the database."""
+        with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("SELECT entry_type, value FROM dynamic_allowlist").fetchall()
+            safe_ips = set()
+            safe_domains = set()
+            for r in rows:
+                if r["entry_type"] == "ip":
+                    safe_ips.add(r["value"])
+                else:
+                    safe_domains.add(r["value"])
+            return {"ips": safe_ips, "domains": safe_domains}

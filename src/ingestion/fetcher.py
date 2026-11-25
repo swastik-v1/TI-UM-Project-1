@@ -1,8 +1,9 @@
-"""Feed fetcher supporting local filesystem and high-speed asynchronous HTTP/HTTPS endpoints."""
+"""Feed fetcher supporting local filesystem and high-speed asynchronous HTTP/HTTPS endpoints with resilience (Circuit Breaker, Rate Limiting & Exponential Retries)."""
 
 import asyncio
 import logging
 from pathlib import Path
+import time
 from typing import List, Optional, Tuple
 import requests
 
@@ -12,30 +13,56 @@ except ImportError:
     httpx = None
 
 from src.models import FeedDefinition
+from src.ingestion.resilience import CircuitBreaker, TokenBucketRateLimiter, get_target_key
 
 logger = logging.getLogger("ti_aggregator.fetcher")
 
-USER_AGENT = "ThreatIntelligenceAggregator/1.1 (+https://github.com/threat-intel)"
+USER_AGENT = "ThreatIntelligenceAggregator/1.2 (+https://github.com/threat-intel)"
+
+# Global resilience singletons
+global_circuit_breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=30.0)
+global_rate_limiter = TokenBucketRateLimiter(rate=5.0, capacity=10.0)
 
 
-def fetch_feed_content(feed: FeedDefinition, base_dir: Path) -> Tuple[Optional[str], str]:
-    """Synchronous fallback to fetch a single feed."""
+def fetch_feed_content(feed: FeedDefinition, base_dir: Path, max_retries: int = 2) -> Tuple[Optional[str], str]:
+    """Synchronous fallback to fetch a single feed with circuit breaking and retries."""
     if feed.source_type == "url" and feed.remote_url:
-        try:
-            logger.info("Fetching remote feed: %s (%s)", feed.name, feed.remote_url)
-            headers = {"User-Agent": USER_AGENT}
-            resp = requests.get(feed.remote_url, headers=headers, timeout=10)
-            resp.raise_for_status()
-            return resp.text, f"remote:{feed.remote_url}"
-        except Exception as e:
-            logger.warning("Failed to fetch remote feed '%s': %s. Checking fallback...", feed.name, e)
+        target_key = get_target_key(feed.remote_url)
+
+        if not global_circuit_breaker.can_execute(target_key):
+            logger.warning("Circuit breaker OPEN for host '%s'. Skipping remote fetch for feed '%s'.", target_key, feed.name)
             if feed.path:
                 local_path = base_dir / feed.path
                 if local_path.is_file():
-                    logger.info("Falling back to local cache fixture: %s", local_path)
+                    logger.info("Circuit breaker fallback to local fixture: %s", local_path)
                     with open(local_path, "r", encoding="utf-8", errors="replace") as f:
-                        return f.read(), f"local_fallback:{local_path}"
-            return None, f"error:{e}"
+                        return f.read(), f"local_circuit_fallback:{local_path}"
+            return None, f"error:circuit_open:{target_key}"
+
+        # Rate limit
+        global_rate_limiter.acquire(target_key)
+
+        headers = {"User-Agent": USER_AGENT}
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info("Fetching remote feed: %s (%s) [Attempt %d/%d]", feed.name, feed.remote_url, attempt + 1, max_retries + 1)
+                resp = requests.get(feed.remote_url, headers=headers, timeout=10)
+                resp.raise_for_status()
+                global_circuit_breaker.record_success(target_key)
+                return resp.text, f"remote:{feed.remote_url}"
+            except Exception as e:
+                logger.warning("Attempt %d failed for '%s': %s", attempt + 1, feed.name, e)
+                if attempt < max_retries:
+                    time.sleep(0.5 * (2 ** attempt))
+
+        global_circuit_breaker.record_failure(target_key)
+        if feed.path:
+            local_path = base_dir / feed.path
+            if local_path.is_file():
+                logger.info("Falling back to local cache fixture: %s", local_path)
+                with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read(), f"local_fallback:{local_path}"
+        return None, f"error:remote_failed_after_retries"
 
     if feed.path:
         local_path = base_dir / feed.path
@@ -58,24 +85,44 @@ async def fetch_feed_async(
     feed: FeedDefinition,
     base_dir: Path,
     client: httpx.AsyncClient,
+    max_retries: int = 2,
 ) -> Tuple[FeedDefinition, Optional[str], str]:
-    """Asynchronously fetches a single threat feed."""
+    """Asynchronously fetches a single threat feed with circuit breaker protection and retries."""
     if feed.source_type == "url" and feed.remote_url:
-        try:
-            logger.info("[Async] Fetching remote feed: %s (%s)", feed.name, feed.remote_url)
-            headers = {"User-Agent": USER_AGENT}
-            resp = await client.get(feed.remote_url, headers=headers, timeout=10.0)
-            resp.raise_for_status()
-            return feed, resp.text, f"remote:{feed.remote_url}"
-        except Exception as e:
-            logger.warning("[Async] Remote fetch failed for '%s': %s. Checking fallback...", feed.name, e)
+        target_key = get_target_key(feed.remote_url)
+
+        if not global_circuit_breaker.can_execute(target_key):
+            logger.warning("[Async] Circuit breaker OPEN for host '%s'. Skipping remote fetch for '%s'.", target_key, feed.name)
             if feed.path:
                 local_path = base_dir / feed.path
                 if local_path.is_file():
-                    logger.info("[Async] Falling back to local fixture: %s", local_path)
                     with open(local_path, "r", encoding="utf-8", errors="replace") as f:
-                        return feed, f.read(), f"local_fallback:{local_path}"
-            return feed, None, f"error:{e}"
+                        return feed, f.read(), f"local_circuit_fallback:{local_path}"
+            return feed, None, f"error:circuit_open:{target_key}"
+
+        global_rate_limiter.acquire(target_key)
+        headers = {"User-Agent": USER_AGENT}
+
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info("[Async] Fetching remote feed: %s (%s) [Attempt %d/%d]", feed.name, feed.remote_url, attempt + 1, max_retries + 1)
+                resp = await client.get(feed.remote_url, headers=headers, timeout=10.0)
+                resp.raise_for_status()
+                global_circuit_breaker.record_success(target_key)
+                return feed, resp.text, f"remote:{feed.remote_url}"
+            except Exception as e:
+                logger.warning("[Async] Attempt %d failed for '%s': %s", attempt + 1, feed.name, e)
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+
+        global_circuit_breaker.record_failure(target_key)
+        if feed.path:
+            local_path = base_dir / feed.path
+            if local_path.is_file():
+                logger.info("[Async] Falling back to local fixture: %s", local_path)
+                with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+                    return feed, f.read(), f"local_fallback:{local_path}"
+        return feed, None, f"error:remote_failed_after_retries"
 
     if feed.path:
         local_path = base_dir / feed.path

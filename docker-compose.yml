@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    container_name: threatforge_web
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - threatforge_data:/app/data
+      - threatforge_exports:/app/exports
+      - ./config:/app/config:ro
+      - ./assets:/app/assets:ro
+    environment:
+      - API_KEY=${API_KEY:-}
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/stats"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  scheduler:
+    build: .
+    container_name: threatforge_scheduler
+    restart: unless-stopped
+    command: ["python", "-m", "src.cli", "scheduler", "--interval", "60"]
+    volumes:
+      - threatforge_data:/app/data
+      - threatforge_exports:/app/exports
+      - ./config:/app/config:ro
+    environment:
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY:-}
+    depends_on:
+      - web
+
+volumes:
+  threatforge_data:
+  threatforge_exports:

@@ -108,6 +108,18 @@ class AppConfig:
         return {
             "host": api.get("host", "127.0.0.1"),
             "port": int(api.get("port", 8000)),
+            "api_key": os.getenv("API_KEY") or api.get("api_key", ""),
+        }
+
+    @property
+    def heuristic_settings(self) -> Dict[str, Any]:
+        h = self.settings_data.get("heuristics", {})
+        return {
+            "enabled": h.get("enabled", True),
+            "dga_detection": h.get("dga_detection", True),
+            "subnet_clustering": h.get("subnet_clustering", True),
+            "dga_score_boost": float(h.get("dga_score_boost", 1.5)),
+            "subnet_cluster_boost": float(h.get("subnet_cluster_boost", 1.0)),
         }
 
     @property
@@ -119,6 +131,7 @@ class AppConfig:
             "proxy_urls": BASE_DIR / exports.get("proxy_urls", "exports/blocklist_proxy.txt"),
             "edr_hashes": BASE_DIR / exports.get("edr_hashes", "exports/blocklist_edr.csv"),
             "all_json": BASE_DIR / exports.get("all_json", "exports/threat_intel_full.json"),
+            "stix_bundle": BASE_DIR / exports.get("stix_bundle", "exports/threat_intel_stix2.json"),
             "summary_report": BASE_DIR / exports.get("summary_report", "exports/threat_report.md"),
         }
 
