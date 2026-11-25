@@ -19,7 +19,7 @@
 
 ## Overview
 
-**ThreatForge** is an enterprise-ready, deterministic Cyber Threat Intelligence Aggregator built in Python. It automatically collects, refangs, validates, normalizes, and correlates Indicators of Compromise (IOCs) across heterogeneous feeds—from raw CSVs and TXT lists to standardized **OASIS STIX 2.1 bundles**.
+**ThreatForge** is an deterministic Cyber Threat Intelligence Aggregator built in Python. It automatically collects, refangs, validates, normalizes, and correlates Indicators of Compromise (IOCs) across heterogeneous feeds—from raw CSVs and TXT lists to standardized **OASIS STIX 2.1 bundles**.
 
 Designed for high-reliability SOC operations and network edge defense, ThreatForge produces hardened, ready-to-deploy firewall rules, DNS sinkholes, proxy blocklists, EDR watchlists, and STIX 2.1 bundles with zero false positives on internal assets and zero AI hallucinations.
 
